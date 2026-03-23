@@ -9,12 +9,15 @@ import sys
 import time
 from pathlib import Path
 
-from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
-# Aggiungi la directory corrente al path per importare ingestion
+# Aggiungi la directory corrente al path per import locali
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ingestion import importa_file, init_db, ESTENSIONI_SUPPORTATE
+
+from config import SUPPORTED_EXTENSIONS, WATCH_DELAY_SECONDS, WATCH_FOLDER
+from db import init_db
+from ingest_pipeline import importa_file
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,20 +25,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ── Configurazione ──────────────────────────────────────────────────────────
-
-CARTELLA_WATCH = os.path.expanduser("~/documenti")
-DELAY_SECONDI  = 5   # attendi N secondi dopo l'evento prima di processare
-                     # (evita di processare file ancora in scrittura)
-
-
-# ── Handler ─────────────────────────────────────────────────────────────────
 
 class DocumentoHandler(FileSystemEventHandler):
     """Gestisce gli eventi filesystem e indicizza i nuovi file."""
 
     def __init__(self):
-        self._in_attesa = {}  # file_path → timestamp ultimo evento
+        self._in_attesa = {}  # file_path -> timestamp ultimo evento
 
     def on_created(self, event):
         if not event.is_directory:
@@ -50,31 +45,38 @@ class DocumentoHandler(FileSystemEventHandler):
             self._schedula(event.dest_path, "spostato")
 
     def _schedula(self, path: str, motivo: str):
-        """Schedula il file per l'import con un delay."""
         ext = Path(path).suffix.lower()
-        if ext not in ESTENSIONI_SUPPORTATE:
+        if ext not in SUPPORTED_EXTENSIONS:
             return
-        log.info("File %s: %s — schedulo import tra %ds",
-                 motivo, os.path.basename(path), DELAY_SECONDI)
+
+        log.info(
+            "File %s: %s — schedulo import tra %ds",
+            motivo,
+            os.path.basename(path),
+            WATCH_DELAY_SECONDS,
+        )
         self._in_attesa[path] = time.time()
 
     def processa_pendenti(self):
-        """Processa i file schedulati il cui delay è scaduto."""
         ora = time.time()
         da_processare = [
             path for path, ts in self._in_attesa.items()
-            if ora - ts >= DELAY_SECONDI
+            if ora - ts >= WATCH_DELAY_SECONDS
         ]
+
         for path in da_processare:
             del self._in_attesa[path]
+
             if not os.path.exists(path):
                 log.warning("File non trovato (cancellato?): %s", path)
                 continue
+
             log.info("Processo: %s", os.path.basename(path))
             try:
                 res = importa_file(path)
+
                 if res["status"] == "importato":
-                    extra = f" → {res['totale']:.2f} EUR" if res.get("totale") else ""
+                    extra = f" → {res['totale']:.2f} EUR" if res.get("totale") is not None else ""
                     log.info("  ✓ %s (%s)%s", res["file"], res["tipo"], extra)
                 elif res["status"] == "già_importato":
                     log.info("  ~ già presente: %s", res["file"])
@@ -84,22 +86,19 @@ class DocumentoHandler(FileSystemEventHandler):
                 log.error("  Errore su %s: %s", os.path.basename(path), e)
 
 
-# ── Main ─────────────────────────────────────────────────────────────────────
-
 def main():
-    cartella = CARTELLA_WATCH
+    cartella = WATCH_FOLDER
 
     if not os.path.isdir(cartella):
         log.error("Cartella non trovata: %s", cartella)
         sys.exit(1)
 
-    # Inizializza DB
     init_db()
 
     log.info("Watcher avviato — monitoro: %s", cartella)
-    log.info("Estensioni supportate: %s", ", ".join(sorted(ESTENSIONI_SUPPORTATE)))
+    log.info("Estensioni supportate: %s", ", ".join(sorted(SUPPORTED_EXTENSIONS)))
 
-    handler  = DocumentoHandler()
+    handler = DocumentoHandler()
     observer = Observer()
     observer.schedule(handler, cartella, recursive=True)
     observer.start()
